@@ -1,0 +1,245 @@
+import numpy as np
+import decimal
+import random
+
+from keras.models import Sequential
+from keras.layers import Dense, Activation, LSTM, Dropout
+from keras.utils import to_categorical
+from keras import optimizers
+from keras import metrics
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix
+
+import pandas as pd
+
+class Forex_Trade(QCAlgorithm):
+    
+    def Initialize(self):
+        
+        self.SetStartDate(2017, 1, 1)
+        self.SetEndDate(2018, 10, 31)
+        self.SetCash(100000)
+        
+        self.CurrencyToTrade = "EURUSD"
+        self.AddForex(self.CurrencyToTrade, Resolution.Daily)
+
+        self.long_list = []
+        self.short_list = []
+        
+        self.model = None
+        self.ModelTrained = False
+        
+        # Indicators to be used
+        self.indicators = {"MACD": [], "RSI": [], "CCI": [], "ROC": [], "ATR": [], "Close": []}
+        self.macd = self.MACD(self.CurrencyToTrade, 12, 26, 9, MovingAverageType.Exponential, Resolution.Daily)
+        self.rsi = self.RSI(self.CurrencyToTrade, 14, Resolution.Daily)
+        self.cci = self.CCI(self.CurrencyToTrade, 20, Resolution.Daily)
+        self.roc = self.ROC(self.CurrencyToTrade, 14, Resolution.Daily)
+        self.atr = self.ROC(self.CurrencyToTrade, 14, Resolution.Daily)
+        
+        # Allow data to be collected prior to start date
+        self.SetWarmUp(500)
+        self.WarmUpCounter = 0
+        
+        self.m = 25  # Number of slices of data to use as predictors in each sample
+        
+        self.scores = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
+        self.previous_prediction = ""
+        
+    def OnData(self, data):
+        
+        # Add new data into dictionary
+        if self.WarmUpCounter >= 30:  # So that the indicators can be computed
+            self.indicators["MACD"].append(float(self.macd.Current.Value))
+            self.indicators["RSI"].append(float(self.rsi.Current.Value))
+            self.indicators["CCI"].append(float(self.cci.Current.Value))
+            self.indicators["ROC"].append(float(self.roc.Current.Value))
+            self.indicators["ATR"].append(float(self.atr.Current.Value))
+            self.indicators["Close"].append(float(data[self.CurrencyToTrade].Close))
+        else: 
+            self.WarmUpCounter += 1
+        
+        #################################
+        ### Prepare the training data ###
+        #################################
+        
+        # Ensure warm up is complete
+        if not self.IsWarmingUp:
+        
+            # Add all indicators into list 
+            datalist = []
+            for indicator_list in self.indicators.values():
+                datalist.append(np.array(indicator_list))
+        
+            L = datalist[0].shape[0]  # L is the number of time slices of data we have
+            m = self.m  # Number of time slices of data we want to use as predictors in each sample
+            
+            # Since we are using 6 different indicators, each row of data will have 6 * m features
+            
+            X_data = None
+
+            for i in range(L-m):
+                
+                row = None
+                
+                for array in datalist:
+                    data = array[i: i+m]
+                    if row is None:
+                        row = data
+                    else:
+                        row = np.concatenate([row, data], axis = 0)
+                
+                row = np.reshape(row, (1, row.shape[0]))
+                
+                if X_data is None:
+                    X_data = row
+                else:
+                    X_data = np.concatenate([X_data, row], axis = 0)
+            
+            Y = self.indicators["Close"][m-1:L]
+            Y_data = []
+            for i in range(len(Y) - 1):
+                if Y[i] >= Y[i+1]:
+                    Y_data.append("DOWN")
+                else:
+                    Y_data.append("UP")
+                    
+            Y_data = np.array(Y_data)
+        
+            #################################
+            ### Optimize model parameters ###
+            #################################
+        
+            # Ensure model is built only once
+            if not self.ModelTrained:
+                
+                # Run cross validation using the data collected during warm-up to find the optimum
+                # parameters for the random forest model
+                tscv = TimeSeriesSplit(n_splits = 5)
+                
+                # For grid search
+                estimators = [100, 200, 300, 400, 500]
+                criteria = ["entropy"]
+                
+                # Dataframe to store final results of cross validation
+                results = pd.DataFrame(columns = ['estimators', 'criteria', 'accuracy'])
+                
+                for n in estimators:
+                    for crit in criteria:
+                            
+                        cvscores = []
+                
+                        for train_index, test_index in tscv.split(X_data):
+                                
+                            X_train, X_test = X_data[train_index], X_data[test_index]
+                            Y_train, Y_test = Y_data[train_index], Y_data[test_index]
+                                
+                            model = RandomForestClassifier(criterion = crit, n_estimators = n)
+                            model.fit(X_train, Y_train)
+                                
+                            # Get the model's performance
+                            score = model.score(X_test, Y_test)
+                            cvscores.append(score)
+                            
+                        # Get the average score across all cross-validations
+                        AvgScore = np.mean(cvscores)
+                        result = pd.DataFrame({"estimators": [n], "criteria": [crit], "accuracy": [AvgScore]})
+                        results = results.append(result)
+                
+                ###################################
+                ### Building an optimized model ###
+                ###################################
+                            
+                # Set every parameter to the value that performed the best in cross validation
+                O_values = results[results['accuracy'] == results['accuracy'].max()]
+                O_estimators = O_values.iloc[0][0]
+                O_crit = O_values.iloc[0][1]
+                
+                # Build the model using the entire training set and the optimized parameters
+                
+                self.model = RandomForestClassifier(criterion = O_crit, n_estimators = O_estimators)
+                self.model.fit(X_data, Y_data)
+                
+                self.ModelTrained = True
+            
+            ######################################
+            ### Prepare data to predict unseen ###
+            ######################################
+            
+            predictors = None
+            
+            for array in datalist:
+                row = array[L-m:]
+                if predictors is None:
+                    predictors = row 
+                else:
+                    predictors = np.concatenate([predictors, row], axis = 0)
+            
+            predictors = np.reshape(predictors, (1, predictors.shape[0]))
+            
+            prediction = self.model.predict(predictors)[0]
+            price = self.indicators["Close"][-1]
+            
+            # Update scores table so that we can track the performance of the model
+            previous_price = self.indicators["Close"][-2]
+            if self.previous_prediction == "UP":
+                if price > previous_price:
+                    self.scores["TP"] += 1
+                else:
+                    self.scores["FP"] += 1
+            elif self.previous_prediction == "DOWN":
+                if price < previous_price:
+                    self.scores["TN"] += 1
+                else:
+                    self.scores["FN"] += 1
+            self.previous_prediction = prediction
+            
+            if self.Time.month == 10 and self.Time.day == 31:
+                self.Debug(self.scores)
+        
+            ###################################
+            ### Execution of trading orders ###
+            ###################################
+            
+            self.Debug("\n")
+            self.Debug("Date is " + str(self.Time.day) + "/" + str(self.Time.month) + "/" + str(self.Time.year))
+            
+            if self.CurrencyToTrade not in self.long_list and self.CurrencyToTrade not in self.short_list:
+                self.Debug("Currently not holding any position")
+                if prediction == "UP":
+                    self.Debug("Price is predicted to go up")
+                    self.Debug("LONG")
+                    self.SetHoldings(self.CurrencyToTrade, 0.9)
+                    self.long_list.append(self.CurrencyToTrade)
+                else:
+                    self.Debug("Prediction predicted to go down")
+                    self.Debug("SHORT")
+                    self.SetHoldings(self.CurrencyToTrade, -0.9)
+                    self.short_list.append(self.CurrencyToTrade)
+                    
+            elif self.CurrencyToTrade in self.long_list:
+                self.Debug("Currently holding " + self.CurrencyToTrade)
+                cost_basis = float(self.Portfolio[self.CurrencyToTrade].AveragePrice)
+                if price <= 0.99 * cost_basis or price >= 1.01 * cost_basis:
+                    self.Debug("SL-TP reached")
+                    self.Debug("SQUARED")
+                    self.SetHoldings(self.CurrencyToTrade, 0)
+                    self.long_list.remove(self.CurrencyToTrade)
+                else:
+                    self.Debug("SL-TP not reached")
+                    self.Debug("DO NOTHING")
+                    
+            elif self.CurrencyToTrade in self.short_list:
+                self.Debug("Currently shorting " + self.CurrencyToTrade)
+                cost_basis = float(self.Portfolio[self.CurrencyToTrade].AveragePrice)
+                if price <= 0.99 * cost_basis or price >= 1.01 * cost_basis:
+                    self.Debug("SL-TP reached")
+                    self.Debug("SQUARED")
+                    self.SetHoldings(self.CurrencyToTrade, 0)
+                    self.short_list.remove(self.CurrencyToTrade)
+                else:
+                    self.Debug("SL-TP not reached")
+                    self.Debug("DO NOTHING")
